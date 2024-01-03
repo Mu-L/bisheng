@@ -11,11 +11,11 @@ redis_password:
 environment:
   env: dev
   uns_support: ['png','jpg','jpeg','bmp','doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'txt', 'md', 'html', 'pdf', 'csv', 'tiff']
-
+              
 # admin 用户配置
 admin:
   user_name: "admin"
-  password: "1234"
+  password: "tzJkPSCZao5hEoZH"
 
 autogen_roles:
   AutoGenAssistant:

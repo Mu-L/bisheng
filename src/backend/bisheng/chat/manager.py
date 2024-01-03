@@ -4,19 +4,21 @@ from collections import defaultdict
 from email.utils import unquote
 from typing import Any, Dict, List
 from urllib.parse import urlparse
+from uuid import UUID
 
+from bisheng.api.utils import build_flow_no_yield
 from bisheng.api.v1.schemas import ChatMessage, ChatResponse, FileResponse
 from bisheng.cache import cache_manager
 from bisheng.cache.flow import InMemoryCache
 from bisheng.cache.manager import Subject
 from bisheng.database.base import session_getter
+from bisheng.database.models.user import User
 from bisheng.processing.process import process_tweaks
-from bisheng.services.deps import get_session_service
-from bisheng.utils.logger import logger
 from bisheng.utils.threadpool import thread_pool
 from bisheng.utils.util import get_cache_key
 from bisheng_langchain.input_output.output import Report
 from fastapi import WebSocket, status
+from loguru import logger
 
 
 class ChatHistory(Subject):
@@ -25,7 +27,12 @@ class ChatHistory(Subject):
         super().__init__()
         self.history: Dict[str, List[ChatMessage]] = defaultdict(list)
 
-    def add_message(self, client_id: str, chat_id: str, message: ChatMessage):
+    def add_message(
+        self,
+        client_id: str,
+        chat_id: str,
+        message: ChatMessage,
+    ):
         """Add a message to the chat history."""
 
         if chat_id and (message.message or message.intermediate_steps
@@ -104,6 +111,7 @@ class ChatManager:
         self.active_connections[get_cache_key(client_id, chat_id)] = websocket
 
     def disconnect(self, client_id: str, chat_id: str):
+        logger.info('disconnect_ws key={}', get_cache_key(client_id, chat_id))
         self.active_connections.pop(get_cache_key(client_id, chat_id), None)
 
     async def send_message(self, client_id: str, chat_id: str, message: str):
@@ -176,11 +184,7 @@ class ChatManager:
 
                 # set start
                 from bisheng.chat.handlers import Handler
-                is_begin = True if payload and status_ == 'init' else False
-                action = None
-                if 'action' in payload:
-                    # autogen continue last session,
-                    action, is_begin = 'autogen', False
+                is_begin = bool(payload and status_ == 'init' and 'action' not in payload)
 
                 start_resp = ChatResponse(type='begin', category='system', user_id=user_id)
                 step_resp = ChatResponse(type='end', category='system', user_id=user_id)
@@ -207,9 +211,10 @@ class ChatManager:
                 # run in thread
                 async_task = None
                 if payload and self.in_memory_cache.get(langchain_obj_key):
-                    logger.info(f"processing_message message={payload['inputs']}")
                     action, over = await self.preper_action(client_id, chat_id, langchain_obj_key,
                                                             payload, start_resp, step_resp)
+                    logger.info(
+                        f"processing_message message={payload.get('inputs')} action={action}")
                     if not over:
                         # task_service: 'TaskService' = get_task_service()
                         # async_task = asyncio.create_task(
@@ -230,8 +235,11 @@ class ChatManager:
                             future.result()
                             logger.debug('task_complete')
                         except Exception as e:
-                            logger.exception(e)
-                            step_resp.intermediate_steps = f'Input data is parsed fail. error={str(e)}'
+                            logger.error('task_exception {}', e)
+                            if status_ == 'init':
+                                step_resp.intermediate_steps = f'LLM 技能执行错误. error={str(e)}'
+                            else:
+                                step_resp.intermediate_steps = f'Input data is parsed fail. error={str(e)}'
                             if has_file:
                                 step_resp.intermediate_steps = f'File is parsed fail. error={str(e)}'
                             await self.send_json(client_id, chat_id, step_resp)
@@ -239,7 +247,7 @@ class ChatManager:
                             await self.send_json(client_id, chat_id, start_resp)
         except Exception as e:
             # Handle any exceptions that might occur
-            logger.exception(e)
+            logger.error(e)
             await self.close_connection(
                 client_id=client_id,
                 chat_id=chat_id,
@@ -284,6 +292,8 @@ class ChatManager:
             action = 'report'
             step_resp.intermediate_steps = 'File parsing complete, generate begin'
             await self.send_json(client_id, chat_id, step_resp)
+        elif 'action' in payload:
+            action = 'autogen'
         elif 'data' in payload['inputs'] or 'file_path' in payload['inputs']:
             action = 'auto_file'
             batch_question = self.in_memory_cache.get(langchain_obj_key + '_question')
@@ -309,27 +319,54 @@ class ChatManager:
                 await self.send_json(client_id, chat_id, step_resp, add=False)
         return action, over
 
-    async def init_langchain_object(self, flow_id, chat_id, user_id, graph_data):
-        session_id = chat_id
-        session_service = get_session_service()
-        if session_id is None:
-            session_id = session_service.generate_key(session_id=session_id, data_graph=graph_data)
-        # Load the graph using SessionService
-        session = await session_service.load_session(session_id, graph_data)
-        graph, artifacts = session if session else (None, None)
-        if not graph:
-            raise ValueError('Graph not found in the session')
-        built_object = await graph.abuild()
+    # async def init_langchain_object(self, flow_id, chat_id, user_id, graph_data):
+    #     session_id = chat_id
+    #     session_service = get_session_service()
+    #     if session_id is None:
+    #         session_id = session_service.generate_key(session_id=session_id, data_graph=graph_data)
+    #     # Load the graph using SessionService
+    #     session = await session_service.load_session(session_id, graph_data)
+    #     graph, artifacts = session if session else (None, None)
+    #     if not graph:
+    #         raise ValueError('Graph not found in the session')
+    #     built_object = await graph.abuild()
+    #     key_node = get_cache_key(flow_id, chat_id)
+    #     logger.info(f'init_langchain key={key_node}')
+    #     question = []
+    #     for node in graph.nodes:
+    #         if node.vertex_type == 'InputNode':
+    #             question.extend(node.build)
+    #     self.set_cache(key_node + '_question', question)
+    #     self.set_cache(key_node, built_object)
+    #     self.set_cache(key_node + '_artifacts', artifacts)
+    #     return built_object
+
+    def init_langchain_object(self, flow_id, chat_id, user_id, graph_data):
         key_node = get_cache_key(flow_id, chat_id)
         logger.info(f'init_langchain key={key_node}')
+        with session_getter() as session:
+            db_user = session.get(User, user_id)  # 用来支持节点判断用户权限
+        artifacts = {}
+        graph = build_flow_no_yield(graph_data=graph_data,
+                                    artifacts=artifacts,
+                                    process_file=True,
+                                    flow_id=UUID(flow_id).hex,
+                                    chat_id=chat_id,
+                                    user_name=db_user.user_name)
+        langchain_object = graph.build()
         question = []
         for node in graph.nodes:
             if node.vertex_type == 'InputNode':
-                question.extend(node.build)
+                question.extend(node._built_object)
+
         self.set_cache(key_node + '_question', question)
-        self.set_cache(key_node, built_object)
-        self.set_cache(key_node + '_artifacts', artifacts)
-        return built_object
+        for node in langchain_object:
+            # 只存储chain
+            if node.base_type == 'inputOutput' and node.vertex_type != 'Report':
+                continue
+            self.set_cache(key_node, node._built_object)
+            self.set_cache(key_node + '_artifacts', artifacts)
+        return graph
 
     def refresh_graph_data(self, graph_data: dict, node_data: List[dict]):
         tweak = {}

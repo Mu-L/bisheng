@@ -1,10 +1,12 @@
 from typing import Optional
+from uuid import uuid4
 
 from bisheng.cache.redis import redis_client
 from bisheng.chat.manager import ChatManager
 from bisheng.database.base import get_session, session_getter
 from bisheng.database.models.flow import Flow
 from bisheng.database.models.message import ChatMessage
+from bisheng.graph.graph.base import Graph
 from bisheng.settings import settings
 from bisheng.utils.logger import logger
 from fastapi import APIRouter, Depends, WebSocket, status
@@ -37,11 +39,25 @@ async def union_websocket(flow_id: str,
         graph_data = db_flow.data
 
     try:
-        await chat_manager.handle_websocket(flow_id,
-                                            chat_id,
-                                            websocket,
-                                            settings.get_from_db('default_operator').get('user'),
-                                            gragh_data=graph_data)
+        graph = Graph.from_payload(graph_data)
+        for node in graph.nodes:
+            if node.base_type == 'vectorstores':
+                if 'collection_name' in node.data.get('node').get('template').keys():
+                    node.data.get('node').get(
+                        'template')['collection_name']['collection_id'] = knowledge_id
+                elif 'index_name' in node.data.get('node').get('template').keys():
+                    node.data.get('node').get(
+                        'template')['index_name']['collection_id'] = knowledge_id
+
+        graph_data = graph.raw_graph_data
+        trace_id = str(uuid4().hex)
+        with logger.contextualize(trace_id=trace_id):
+            await chat_manager.handle_websocket(
+                flow_id,
+                chat_id,
+                websocket,
+                settings.get_from_db('default_operator').get('user'),
+                gragh_data=graph_data)
     except Exception as exc:
         logger.error(exc)
         await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason=str(exc))
