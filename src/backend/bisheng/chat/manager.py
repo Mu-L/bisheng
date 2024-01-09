@@ -1,9 +1,9 @@
 import asyncio
 import json
+import time
 from collections import defaultdict
-from email.utils import unquote
 from typing import Any, Dict, List
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from uuid import UUID
 
 from bisheng.api.utils import build_flow_no_yield
@@ -12,9 +12,10 @@ from bisheng.cache import cache_manager
 from bisheng.cache.flow import InMemoryCache
 from bisheng.cache.manager import Subject
 from bisheng.database.base import session_getter
+from bisheng.database.models.flow import Flow
 from bisheng.database.models.user import User
 from bisheng.processing.process import process_tweaks
-from bisheng.utils.threadpool import thread_pool
+from bisheng.utils.threadpool import ThreadPoolManager, thread_pool
 from bisheng.utils.util import get_cache_key
 from bisheng_langchain.input_output.output import Report
 from fastapi import WebSocket, status
@@ -161,9 +162,10 @@ class ChatManager:
         gragh_data: dict = None,
     ):
         await self.connect(client_id, chat_id, websocket)
-
+        autogen_pool = ThreadPoolManager(max_workers=1, thread_name_prefix='autogen')
         status_ = 'init'  # 创建锁
         payload = {}
+
         try:
             while True:
                 try:
@@ -176,11 +178,11 @@ class ChatManager:
                 except TypeError:
                     payload = json_payload_receive
 
-                if 'clear_history' in payload:
-                    self.chat_history.history[client_id] = []
-                    continue
-                if 'clear_cache' in payload:
-                    self.in_memory_cache
+                # websocket multi use
+                if 'flow_id' in payload:
+                    flow_id = payload.get('flow_id')
+                    with session_getter() as session:
+                        gragh_data = session.get(Flow, flow_id)
 
                 # set start
                 from bisheng.chat.handlers import Handler
@@ -204,8 +206,12 @@ class ChatManager:
                 # build in thread
                 if payload and not self.in_memory_cache.get(
                         langchain_obj_key) and status_ == 'init_object':
-                    thread_pool.submit(self.init_langchain_object, client_id, chat_id, user_id,
-                                       graph_data)
+                    thread_pool.submit(self.init_langchain_object,
+                                       client_id,
+                                       chat_id,
+                                       user_id,
+                                       graph_data,
+                                       trace_id=chat_id)
                     status_ = 'waiting_object'
 
                 # run in thread
@@ -220,8 +226,26 @@ class ChatManager:
                         # async_task = asyncio.create_task(
                         #     task_service.launch_task(Handler().dispatch_task, self, client_id,
                         #                              chat_id, action, payload, user_id))
-                        thread_pool.submit(Handler().dispatch_task, self, client_id, chat_id,
-                                           action, payload, user_id)
+                        from bisheng_langchain.chains.autogen.auto_gen import AutoGenChain
+                        if isinstance(self.in_memory_cache.get(langchain_obj_key), AutoGenChain):
+                            # autogen chain
+                            autogen_pool.submit(Handler().dispatch_task,
+                                                self,
+                                                client_id,
+                                                chat_id,
+                                                action,
+                                                payload,
+                                                user_id,
+                                                trace_id=chat_id)
+                        else:
+                            thread_pool.submit(Handler().dispatch_task,
+                                               self,
+                                               client_id,
+                                               chat_id,
+                                               action,
+                                               payload,
+                                               user_id,
+                                               trace_id=chat_id)
                     status_ = 'init'
                     payload = {}  # clean message
 
@@ -235,7 +259,7 @@ class ChatManager:
                             future.result()
                             logger.debug('task_complete')
                         except Exception as e:
-                            logger.error('task_exception {}', e)
+                            logger.exception(e)
                             if status_ == 'init':
                                 step_resp.intermediate_steps = f'LLM 技能执行错误. error={str(e)}'
                             else:
@@ -247,12 +271,12 @@ class ChatManager:
                             await self.send_json(client_id, chat_id, start_resp)
         except Exception as e:
             # Handle any exceptions that might occur
-            logger.error(e)
+            logger.error(str(e))
             await self.close_connection(
                 client_id=client_id,
                 chat_id=chat_id,
                 code=status.WS_1011_INTERNAL_ERROR,
-                reason=str(e)[:120],
+                reason='后端未知错误类型',
             )
         finally:
             try:
@@ -261,7 +285,7 @@ class ChatManager:
                                             code=status.WS_1000_NORMAL_CLOSURE,
                                             reason='Client disconnected')
             except Exception as e:
-                logger.error(e)
+                logger.exception(e)
             self.disconnect(client_id, chat_id)
 
     async def preper_payload(self, payload, graph_data, langchain_obj_key, client_id, chat_id,
@@ -341,30 +365,33 @@ class ChatManager:
     #     self.set_cache(key_node + '_artifacts', artifacts)
     #     return built_object
 
-    def init_langchain_object(self, flow_id, chat_id, user_id, graph_data):
+    async def init_langchain_object(self, flow_id, chat_id, user_id, graph_data):
         key_node = get_cache_key(flow_id, chat_id)
-        logger.info(f'init_langchain key={key_node}')
+        logger.info(f'init_langchain build_begin key={key_node}')
         with session_getter() as session:
             db_user = session.get(User, user_id)  # 用来支持节点判断用户权限
         artifacts = {}
-        graph = build_flow_no_yield(graph_data=graph_data,
-                                    artifacts=artifacts,
-                                    process_file=True,
-                                    flow_id=UUID(flow_id).hex,
-                                    chat_id=chat_id,
-                                    user_name=db_user.user_name)
-        langchain_object = graph.build()
+        start_time = time.time()
+        graph = await build_flow_no_yield(graph_data=graph_data,
+                                          artifacts=artifacts,
+                                          process_file=True,
+                                          flow_id=UUID(flow_id).hex,
+                                          chat_id=chat_id,
+                                          user_name=db_user.user_name)
+        await graph.abuild()
+        logger.info(f'init_langchain build_end timecost={time.time() - start_time}')
         question = []
-        for node in graph.nodes:
+        for node in graph.vertices:
             if node.vertex_type == 'InputNode':
-                question.extend(node._built_object)
+                question.extend(await node.get_result())
 
         self.set_cache(key_node + '_question', question)
-        for node in langchain_object:
+        input_nodes = graph.get_input_nodes()
+        for node in input_nodes:
             # 只存储chain
             if node.base_type == 'inputOutput' and node.vertex_type != 'Report':
                 continue
-            self.set_cache(key_node, node._built_object)
+            self.set_cache(key_node, await node.get_result())
             self.set_cache(key_node + '_artifacts', artifacts)
         return graph
 

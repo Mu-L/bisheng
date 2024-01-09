@@ -11,7 +11,7 @@ from bisheng.settings import settings
 from bisheng.utils.logger import logger
 from sqlmodel import Session, select
 
-db_service = DatabaseService(settings.database_url)
+db_service: 'DatabaseService' = DatabaseService(settings.database_url)
 
 
 def init_default_data():
